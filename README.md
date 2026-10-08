@@ -1,18 +1,16 @@
-%md
-
-# Formula 1 Data Lakehouse
+# Formula 1 Data Engineering Project
 
 ## Project Overview
 
-This project implements an end-to-end **Formula 1 Data Lakehouse on Azure Databricks**.
+This project implements an end-to-end **Formula 1 Data Lakehouse using Azure Databricks**.
 
-The solution ingests Formula 1 source data stored in **Azure Data Lake Storage Gen2**, processes it through **Landing, Bronze, Silver and Gold layers**, and builds analytics-ready datasets for analyzing driver and constructor performance across seasons.
+The solution ingests Formula 1 racing data from multiple source formats, processes it through a **Landing → Bronze → Silver → Gold** architecture, and builds analytics-ready datasets for analyzing driver and constructor performance across seasons.
 
-The final Gold model is exposed through analytics views and an interactive **Databricks Dashboard**.
+The pipeline was initially implemented using full-refresh processing and later enhanced into a **batch-based incremental pipeline** that processes only newly arrived race batches.
 
 ---
 
-## Architecture
+## Solution Architecture
 
 ```text
 Formula 1 Source Data
@@ -21,22 +19,23 @@ Formula 1 Source Data
 Azure Data Lake Storage Gen2
         |
         v
-Landing
-Raw CSV / JSON Files
-Unity Catalog External Volume
+Landing Layer
+Batch-based Raw Files
         |
         v
-Bronze
+Bronze Layer
 Delta Tables
-Schema + Audit Metadata
+Append + Audit Metadata
         |
         v
-Silver
-Clean + Standardized + DQ
+Silver Layer
+Clean + Standardize
+Data Quality + MERGE
         |
         v
-Gold
+Gold Layer
 Dimensional Model
+Incremental MERGE
         |
         v
 Analytics Views
@@ -51,16 +50,18 @@ Databricks Dashboard
 
 The project uses Formula 1 data based on the open-source **Jolpica F1 dataset/API**, following the relational-style Ergast data model.
 
+Six primary datasets are processed:
+
 | Dataset | Description | Format |
 |---|---|---|
 | Circuits | Circuit and geographical information | CSV |
 | Races | Race details by season and round | CSV |
 | Constructors | Formula 1 teams | JSON |
-| Drivers | Driver information | Nested JSON |
-| Results | Race results, positions, laps and points | Multi-file JSON |
+| Drivers | Driver information including nested attributes | JSON |
+| Results | Driver race results, positions, laps and points | Multi-file JSON |
 | Sprints | Sprint race results | Multi-line, multi-file JSON |
 
-The project handles multiple ingestion patterns including CSV, JSON, nested JSON, multi-line JSON and multi-file datasets.
+This provides ingestion scenarios involving CSV, JSON, nested JSON, multi-line JSON and multi-file datasets.
 
 ---
 
@@ -77,38 +78,58 @@ The project handles multiple ingestion patterns including CSV, JSON, nested JSON
 
 ---
 
-## Lakehouse Design
+## Lakehouse Layers
 
-### Landing
+### Landing Layer
 
-Raw Formula 1 files are stored in **ADLS Gen2** and exposed to Databricks through a **Unity Catalog External Volume**.
+Raw Formula 1 source files are stored in **Azure Data Lake Storage Gen2 (ADLS Gen2)**.
 
-No business transformation is applied at this stage.
+The Landing location is exposed to Databricks using a **Unity Catalog External Volume**.
 
-### Bronze
+For incremental processing, data is organized into batch folders such as:
 
-The Bronze layer stores a structured and traceable representation of the source data.
+```text
+landing/
+├── 2025-01/
+├── 2025-02/
+├── 2025-03/
+└── ...
+```
+
+Each `batch_id` represents a Formula 1 season and race round.
+
+---
+
+### Bronze Layer
+
+The Bronze layer preserves source data with minimal transformation while maintaining traceability.
 
 Key processing includes:
 
-- Explicit schema and data type handling
-- Addition of `ingestion_timestamp`
-- Addition of `source_file`
-- Minimal transformation
-- Storage as Delta tables
+- Explicit schemas and appropriate data types
+- Source file name
+- Ingestion timestamp
+- Batch ID
+- Delta table storage
+- Append-based processing to preserve batch history
 
-### Silver
+Bronze acts as the historical record of data received from the source.
 
-The Silver layer creates clean and trusted datasets.
+---
 
-Transformations include:
+### Silver Layer
 
-- Standardizing column names and data types
-- Flattening nested JSON
-- Removing unnecessary attributes
+The Silver layer produces clean and trusted datasets.
+
+Processing includes:
+
+- Standardized column names and data types
+- Nested JSON flattening
+- Removal of unnecessary attributes
 - Null business-key validation
 - Duplicate removal
-- Preserving business keys and relationships
+- Preservation of business keys and relationships
+- Incremental `MERGE` for inserts and updates
 
 Silver contains:
 
@@ -121,9 +142,13 @@ results
 sprints
 ```
 
-### Gold
+---
 
-The Gold layer is designed using **dimensional modeling** to support analytical and reporting requirements.
+## Gold Layer
+
+The Gold layer is designed using **dimensional modeling** based on analytical requirements.
+
+Instead of exposing the Silver tables directly to reporting users, the Gold layer provides a Star Schema:
 
 ```text
                          dim_races
@@ -132,32 +157,19 @@ The Gold layer is designed using **dimensional modeling** to support analytical 
 dim_drivers ------ fact_session_results ------ dim_constructors
 ```
 
-The model contains:
+### Dimensions
 
 - `dim_drivers`
 - `dim_constructors`
 - `dim_races`
-- `fact_session_results`
 
----
+### Fact Table
 
-## Fact Table Design
+`fact_session_results` contains both Race and Sprint results.
 
-`fact_session_results` represents:
+Race and Sprint datasets have compatible schemas and the same analytical grain, so they are combined into a single fact table.
 
-> One driver's result for a particular Formula 1 Race or Sprint session.
-
-Race results and Sprint results have compatible schemas and grain, so they are combined into a single fact table.
-
-```text
-results -----\
-              \
-               ---> fact_session_results
-              /
-sprints -----/
-```
-
-A `session_type` column identifies whether the record belongs to:
+A `session_type` column identifies whether a record represents:
 
 ```text
 Race
@@ -166,17 +178,15 @@ Sprint
 
 The two datasets are combined using `unionByName()`.
 
-The fact also contains derived analytical flags:
+The fact table also contains derived analytical fields:
 
 ```text
 is_win      -> final_position = 1
-
 is_podium   -> final_position between 1 and 3
-
 has_points  -> points > 0
 ```
 
-These make common analytical queries easier and more consistent.
+These simplify common analytical queries such as wins, podiums and points analysis.
 
 ---
 
@@ -201,9 +211,153 @@ sprints --------/
 
 ---
 
+## Incremental Processing
+
+The first version of the pipeline used a **full refresh**, where all historical data was reprocessed during every execution.
+
+The pipeline was later enhanced to use **batch-based incremental processing**.
+
+### Batch Design
+
+Each race batch is stored in a separate Landing folder:
+
+```text
+2025-01
+2025-02
+2025-03
+...
+```
+
+`2025-01` acts as the initial cutover batch and contains historical data up to that point. Subsequent folders contain data for the newly completed race.
+
+### Source Data Types
+
+The datasets follow two ingestion patterns:
+
+**Snapshot-style data**
+- Circuits
+- Races
+- Constructors
+- Drivers
+
+**Change data**
+- Results
+- Sprints
+
+Bronze appends all incoming batches to preserve history.
+
+Silver and Gold use Delta `MERGE` for both snapshot and change datasets so the pipeline can safely handle:
+
+- New records
+- Updated records
+- Duplicate prevention
+- Batch reruns
+- Out-of-order batch processing
+
+---
+
+## Batch Control & Orchestration
+
+A Delta control table tracks the processing status of each batch.
+
+```text
+batch_control
+-----------------------------------------
+batch_id
+status
+created_timestamp
+updated_timestamp
+```
+
+Example:
+
+```text
+batch_id | status
+---------|----------
+2025-01  | completed
+2025-02  | completed
+2025-03  | in_progress
+```
+
+The orchestration flow is:
+
+```text
+Landing Batch Folders
+        |
+        v
+Identify Next Batch
+        |
+        v
+Mark Batch as in_progress
+        |
+        v
+Process Bronze
+        |
+        v
+Process Silver
+        |
+        v
+Process Gold
+        |
+        v
+Mark Batch as completed
+```
+
+The pipeline compares batch folders available in Landing with the batches already tracked in `batch_control`.
+
+The earliest unprocessed batch is selected and passed to downstream Databricks Job tasks using:
+
+```text
+p_batch_id
+has_batch
+```
+
+If no new batch is available, `has_batch` is set to `false`, allowing the pipeline to complete without unnecessarily executing downstream processing.
+
+---
+
+## Pipeline Orchestration
+
+The end-to-end workflow is orchestrated using **Databricks Jobs**.
+
+```text
+Identify Next Batch
+        |
+        v
+Create New Batch
+        |
+        v
+Bronze Ingestion
+        |
+        v
+Silver Transformation
+        |
+        v
+Gold Dimensional Model
+        |
+        v
+Analytics Views
+        |
+        v
+Complete Batch
+```
+
+Databricks Jobs provides:
+
+- Task dependencies
+- Parameter passing between tasks
+- Scheduled execution
+- Retry handling
+- Pipeline monitoring
+- Failure alerts
+
+The target schedule is **every Sunday at 10 PM**.
+
+---
+
 ## Analytics
 
-Analytics views are created on top of the Gold model to support:
+Analytics views are created on top of the Gold dimensional model to support:
 
 - Driver standings by season
 - Constructor standings by season
@@ -227,154 +381,93 @@ Rank within Season
 Driver / Constructor Standings
 ```
 
-These views are used by the **Databricks Dashboard** for reporting and visualization.
+The analytics views are consumed by an interactive **Databricks Dashboard**.
 
 ---
 
-## Delta Lake
+## Delta Lake Capabilities
 
-Delta Lake is used from the Bronze layer onward to provide reliable table operations.
+Delta Lake is used throughout the processing layers to provide reliable table operations.
 
-Key capabilities used by the solution include:
+Key capabilities used include:
 
 - ACID transactions
-- Consistent reads
-- Version history
-- Time travel
+- Incremental `MERGE`
 - Updates and deletes
-- MERGE support
+- Consistent reads
+- Table version history
+- Time travel
 - Data correction and rollback
 
-Delta stores the actual data in Parquet files and tracks committed table state through the `_delta_log`.
+Delta stores the underlying data in Parquet files and tracks committed table state using the `_delta_log`.
 
 ---
 
-## Unity Catalog
+## Unity Catalog & Data Organization
 
-Unity Catalog is used to organize and govern the project.
+Unity Catalog is used for centralized organization and governance.
 
-```text
-formula1
-|
-+-- landing
-|   +-- files
-|       External Volume
-|
-+-- bronze
-|   Delta Tables
-|
-+-- silver
-|   Delta Tables
-|
-+-- gold
-    Dimensions
-    Fact Table
-    Analytics Views
-```
-
-ADLS Gen2 provides the physical storage, while Unity Catalog provides the governed namespace for schemas, tables, views and volumes.
-
----
-
-## Pipeline Orchestration
-
-The end-to-end workflow is orchestrated using **Databricks Jobs**.
+For the incremental pipeline, the project uses:
 
 ```text
-Bronze Ingestion
-       |
-       v
-Silver Transformation
-       |
-       v
-Gold Dimensional Model
-       |
-       v
-Analytics Views
-       |
-       v
-Dashboard
+formula1_incr
+|
+├── landing
+│   └── files              # External Volume
+│
+├── bronze
+│   └── Delta Tables
+│
+├── silver
+│   └── Delta Tables
+│
+├── gold
+│   ├── Dimensions
+│   ├── fact_session_results
+│   └── Analytics Views
+│
+└── control
+    └── batch_control
 ```
 
-The pipeline supports:
-
-- Task dependencies
-- Scheduled execution
-- Retry handling
-- Monitoring
-- Failure alerts
-- Graceful completion when no new race data is available
-
-The target schedule is **every Sunday at 10 PM**.
-
----
-
-## Processing Strategy
-
-The project initially uses full-load processing and is designed to evolve toward incremental processing using Delta Lake capabilities such as:
-
-```text
-MERGE
-UPDATE
-DELETE
-```
+ADLS Gen2 stores the physical data, while Unity Catalog provides the governed namespace for catalogs, schemas, tables, views and volumes.
 
 ---
 
 ## Key Engineering Highlights
 
 - End-to-end Azure Databricks Lakehouse pipeline
+- Landing, Bronze, Silver and Gold architecture
 - Multi-format CSV and JSON ingestion
 - Explicit schema enforcement
 - Audit metadata and source traceability
-- Delta Lake storage
-- Data cleansing and standardization
-- Nested JSON flattening
+- Batch-based incremental processing
+- Batch control framework
+- Parameterized notebook execution
+- Bronze append-based history
+- Silver and Gold Delta `MERGE`
+- Snapshot and change-data handling
 - Null-key validation and deduplication
+- Nested JSON flattening
 - Unity Catalog-based governance
 - Requirement-driven dimensional modeling
-- Star Schema design
 - Unified Race and Sprint fact table
 - Derived analytical indicators
 - Driver and constructor standings
-- Historical performance analysis
-- Analytics views and dashboard
+- Analytics views and Databricks dashboard
 - Databricks Jobs orchestration
-
----
-
-## Final Data Flow
-
-```text
-Source Data
-    |
-    v
-Landing
-    |
-    v
-Bronze
-    |
-    v
-Silver
-    |
-    v
-Gold
-    |
-    v
-Analytics Views
-    |
-    v
-Databricks Dashboard
-```
+- Delta ACID transactions and time travel
 
 ---
 
 ## Project Objective
 
-The project demonstrates the complete data engineering lifecycle using Azure Databricks:
+The project demonstrates how a modern **Azure Databricks Lakehouse** can be used to build a governed, reliable and scalable data engineering pipeline covering the complete data lifecycle:
 
 ```text
 Ingestion
+   ->
+Incremental Processing
    ->
 Transformation
    ->
